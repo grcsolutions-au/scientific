@@ -79,6 +79,8 @@ module Data.Scientific
     , toRealFloat
     , toBoundedRealFloat
     , toBoundedInteger
+    , toBoundedIntegerOrErrorReason
+    , ToBoundedIntegerError(..)
     , fromFloatDigits
 
       -- * Parsing
@@ -120,8 +122,8 @@ import qualified Text.ParserCombinators.ReadP    as ReadP
 import           Text.ParserCombinators.ReadP     ( ReadP )
 import           Data.Text.Lazy.Builder.RealFloat (FPFormat(..))
 
-import GHC.Integer.Compat (quotRemInteger, quotInteger, divInteger)
-import Utils              (maxExpt, roundTo, magnitude)
+import GHC.Integer.Compat (quotRemInteger, quotInteger, divInteger, IntegerClass(..), classifyInteger)
+import Utils              (maxExpt, roundTo, magnitude, scaledInt)
 
 import Language.Haskell.TH.Syntax (Lift (..))
 
@@ -786,39 +788,26 @@ toBoundedRealFloat s@(Scientific c e)
     sign x | c < 0     = -x
            | otherwise =  x
 
+-- | The reasons why 'toBoundedIntegerOrErrorReason' can fail.
+data ToBoundedIntegerError
+    = NotAnInteger
+      -- ^ The number has a fractional part.
+    | TooLarge
+      -- ^ The number is greater than the upper bound of the target type.
+    | TooSmall
+      -- ^ The number is smaller than the lower bound of the target type.
+    deriving (Eq, Ord, Show, Enum, Bounded)
+
 -- | Convert a `Scientific` to a bounded integer.
 --
 -- If the given `Scientific` doesn't fit in the target representation, it will
--- return `Nothing`.
+-- return `Nothing`. Use 'toBoundedIntegerOrErrorReason' to find out why.
 --
 -- This function also guards against computing huge Integer magnitudes (@10^e@)
 -- that could fill up all space and crash your program.
-toBoundedInteger :: forall i. (Integral i, Bounded i) => Scientific -> Maybe i
-toBoundedInteger (isInteger_ -> Just (Scientific c e))
-    | c == 0         = fromIntegerBounded 0
-    | e == 0         = fromIntegerBounded c
-    | dangerouslyBig = Nothing
-    | otherwise      = fromIntegerBounded n
-  where
-    l  = integerLog10' (abs c) + e
-
-    -- whether logarithm of s is bigger than logarithm of source type bounds
-    dangerouslyBig = l > 1 + integerLog10' (max (abs iMinBound) (abs iMaxBound))
-
-    fromIntegerBounded :: Integer -> Maybe i
-    fromIntegerBounded i
-        | i < iMinBound || i > iMaxBound = Nothing
-        | otherwise                      = Just $ fromInteger i
-
-    iMinBound = toInteger (minBound :: i)
-    iMaxBound = toInteger (maxBound :: i)
-
-    -- This should not be evaluated if the given Scientific is dangerouslyBig
-    -- since it could consume all space and crash the process
-    n :: Integer
-    n = c * magnitude e
-
-toBoundedInteger _ = Nothing
+toBoundedInteger :: (Integral i, Bounded i) => Scientific -> Maybe i
+toBoundedInteger = toBoundedIntegerWith (const Nothing) Just
+{-# INLINABLE toBoundedInteger #-}
 
 {-# SPECIALIZE toBoundedInteger :: Scientific -> Maybe Int #-}
 {-# SPECIALIZE toBoundedInteger :: Scientific -> Maybe Int8 #-}
@@ -830,6 +819,187 @@ toBoundedInteger _ = Nothing
 {-# SPECIALIZE toBoundedInteger :: Scientific -> Maybe Word16 #-}
 {-# SPECIALIZE toBoundedInteger :: Scientific -> Maybe Word32 #-}
 {-# SPECIALIZE toBoundedInteger :: Scientific -> Maybe Word64 #-}
+
+-- | Like 'toBoundedInteger', but reports why the conversion failed.
+--
+-- >>> toBoundedIntegerOrErrorReason 127 :: Either ToBoundedIntegerError Int8
+-- Right 127
+-- >>> toBoundedIntegerOrErrorReason 1.28e2 :: Either ToBoundedIntegerError Int8
+-- Left TooLarge
+-- >>> toBoundedIntegerOrErrorReason (-1.29e2) :: Either ToBoundedIntegerError Int8
+-- Left TooSmall
+-- >>> toBoundedIntegerOrErrorReason 1.5 :: Either ToBoundedIntegerError Int8
+-- Left NotAnInteger
+--
+-- @since 0.3.11.0
+toBoundedIntegerOrErrorReason
+    :: (Integral i, Bounded i) => Scientific -> Either ToBoundedIntegerError i
+toBoundedIntegerOrErrorReason = toBoundedIntegerWith Left Right
+{-# INLINABLE toBoundedIntegerOrErrorReason #-}
+
+{-# SPECIALIZE toBoundedIntegerOrErrorReason :: Scientific -> Either ToBoundedIntegerError Int #-}
+{-# SPECIALIZE toBoundedIntegerOrErrorReason :: Scientific -> Either ToBoundedIntegerError Int8 #-}
+{-# SPECIALIZE toBoundedIntegerOrErrorReason :: Scientific -> Either ToBoundedIntegerError Int16 #-}
+{-# SPECIALIZE toBoundedIntegerOrErrorReason :: Scientific -> Either ToBoundedIntegerError Int32 #-}
+{-# SPECIALIZE toBoundedIntegerOrErrorReason :: Scientific -> Either ToBoundedIntegerError Int64 #-}
+{-# SPECIALIZE toBoundedIntegerOrErrorReason :: Scientific -> Either ToBoundedIntegerError Word #-}
+{-# SPECIALIZE toBoundedIntegerOrErrorReason :: Scientific -> Either ToBoundedIntegerError Word8 #-}
+{-# SPECIALIZE toBoundedIntegerOrErrorReason :: Scientific -> Either ToBoundedIntegerError Word16 #-}
+{-# SPECIALIZE toBoundedIntegerOrErrorReason :: Scientific -> Either ToBoundedIntegerError Word32 #-}
+{-# SPECIALIZE toBoundedIntegerOrErrorReason :: Scientific -> Either ToBoundedIntegerError Word64 #-}
+
+-- | The shared implementation of 'toBoundedInteger' and
+-- 'toBoundedIntegerOrErrorReason', with continuations for failure and
+-- success.
+--
+-- Each public function is a separate instantiation of this, so its result
+-- type is built directly. Defining 'toBoundedInteger' on top of the 'Either'
+-- version instead allocates a 'Right' and then converts it to a 'Just'.
+--
+-- The coefficient and both bounds of @i@ are classified as fitting in an
+-- 'Int', or lying above or below the 'Int' range ('classifyInteger'). At a
+-- known type the bounds are constants, so every branch on them folds away.
+--
+-- * If the coefficient fits in an 'Int', 'scaledInt' computes @c * 10^e@ as
+--   an 'Int' without 'Integer' arithmetic, or reports that it overflows or
+--   has a fractional part. The 'Int' is compared against the bounds.
+--
+-- * A value outside the 'Int' range with a non-negative exponent (an
+--   overflowing @c * 10^e@, or a coefficient that doesn't fit in an 'Int')
+--   is rejected at once, unless the bound of @i@ on that side is also outside
+--   the 'Int' range. Only then is 'Integer' arithmetic used, e.g. for
+--   'Word64' values above @maxBound :: Int@.
+--
+-- * A coefficient outside the 'Int' range with a negative exponent is rare.
+--   It is normalised ('isIntegerNegativeExponentLarge'), and the result is
+--   compared against the bounds as an 'Integer'.
+--
+-- So after specialisation, types whose bounds fit in an 'Int' have no
+-- 'Integer' arithmetic of their own, except on that rare path.
+toBoundedIntegerWith
+    :: forall i r. (Integral i, Bounded i)
+    => (ToBoundedIntegerError -> r) -> (i -> r) -> Scientific -> r
+toBoundedIntegerWith failure success (Scientific c0 e0) =
+    case classifyInteger c0 of
+      SmallInt ci -> case scaledInt ci e0 of
+        Nothing            -> failure NotAnInteger
+        Just (SmallInt n)  -> fromInt n
+        -- scaledInt only gives these for a positive exponent, which the slow
+        -- path needs.
+        Just LargePositive -> aboveIntMax
+        Just LargeNegative -> belowIntMin
+      -- A large coefficient with a non-negative exponent: c0 * 10^e0 is
+      -- outside the 'Int' range too, on the same side.
+      LargePositive | e0 >= 0 -> aboveIntMax
+      LargeNegative | e0 >= 0 -> belowIntMin
+      -- A large coefficient with a negative exponent. This is rare, so
+      -- normalise it and compare the result as an 'Integer'.
+      _ -> maybe (failure NotAnInteger) fromIntegerBounded
+             (isIntegerNegativeExponentLarge c0 e0)
+  where
+    fromInt :: Int -> r
+    fromInt n
+      | aboveMaxBoundInt n = failure TooLarge
+      | belowMinBoundInt n = failure TooSmall
+      | otherwise          = success (fromIntegral n)
+    {-# INLINE fromInt #-}
+
+    iMin, iMax :: Integer
+    iMin = toInteger (minBound :: i)
+    iMax = toInteger (maxBound :: i)
+
+    -- Constants at a known type.
+    cmin, cmax :: IntegerClass
+    cmin = classifyInteger iMin
+    cmax = classifyInteger iMax
+
+    -- Whether an 'Int' value is below the lower bound of i.
+    belowMinBoundInt :: Int -> Bool
+    belowMinBoundInt n = case cmin of
+      SmallInt b    -> n < b
+      LargeNegative -> False
+      LargePositive -> True
+    {-# INLINE belowMinBoundInt #-}
+
+    -- Whether an 'Int' value is above the upper bound of i.
+    aboveMaxBoundInt :: Int -> Bool
+    aboveMaxBoundInt n = case cmax of
+      SmallInt b    -> n > b
+      LargePositive -> False
+      LargeNegative -> True
+    {-# INLINE aboveMaxBoundInt #-}
+
+    -- The number is above the 'Int' range, and has a non-negative exponent.
+    -- It can only fit if the upper bound of i is above the 'Int' range too.
+    --
+    -- Even then, the coefficient is non-zero, so the value is at least
+    -- @10^e0@. The bounds are below @10^(boundsLog + 1)@, so if
+    -- @e0 > boundsLog@ the value is too large without computing anything.
+    -- That avoids 'integerLog10'' in 'slow' for e.g. @1e500 :: Word64@.
+    aboveIntMax :: r
+    aboveIntMax = case cmax of
+      LargePositive
+        | e0 > boundsLog -> failure TooLarge
+        | otherwise      -> slow
+      _                  -> failure TooLarge
+
+    -- The number is below the 'Int' range, and has a non-negative exponent.
+    -- It can only fit if the lower bound of i is below the 'Int' range too.
+    -- See 'aboveIntMax' for the exponent check.
+    belowIntMin :: r
+    belowIntMin = case cmin of
+      LargeNegative
+        | e0 > boundsLog -> failure TooSmall
+        | otherwise      -> slow
+      _                  -> failure TooSmall
+
+    -- The conversion using 'Integer' arithmetic. Requires e0 >= 0.
+    slow :: r
+    slow
+        | c0 == 0        = fromIntegerBounded 0
+        | e0 == 0        = fromIntegerBounded c0
+        | dangerouslyBig = failure (if c0 > 0 then TooLarge else TooSmall)
+        | otherwise      = fromIntegerBounded n
+      where
+        l = integerLog10' (abs c0) + e0
+
+        -- whether logarithm of s is bigger than logarithm of source type
+        -- bounds
+        dangerouslyBig = l > 1 + boundsLog
+
+        -- This should not be evaluated if the given Scientific is
+        -- dangerouslyBig since it could consume all space and crash the
+        -- process
+        n :: Integer
+        n = c0 * magnitude e0
+
+    -- The logarithm of the bounds of i. This is a constant at a known type.
+    -- NOINLINE keeps it a boxed binding, which GHC floats to a top-level
+    -- constant in each specialisation. Inlined, GHC computes it unboxed on
+    -- every call instead, which costs about 40 ns for 'Word64'.
+    boundsLog :: Int
+    boundsLog = integerLog10' (max (abs iMin) (abs iMax))
+    {-# NOINLINE boundsLog #-}
+
+    -- The bounds for the 'Integer' comparisons. Like 'boundsLog', NOINLINE
+    -- makes GHC float these to top-level constants. Inlined, a bound outside
+    -- the 'Int' range (e.g. @maxBound :: Word64@) is rebuilt on every call,
+    -- even on paths that never compare against it, which costs about 2 ns.
+    -- 'cmin' and 'cmax' use iMin and iMax directly, so they still fold.
+    iMinInteger, iMaxInteger :: Integer
+    iMinInteger = iMin
+    {-# NOINLINE iMinInteger #-}
+    iMaxInteger = iMax
+    {-# NOINLINE iMaxInteger #-}
+
+    fromIntegerBounded :: Integer -> r
+    fromIntegerBounded n
+        | n < iMinInteger = failure TooSmall
+        | n > iMaxInteger = failure TooLarge
+        | otherwise       = success (fromInteger n)
+{-# INLINE toBoundedIntegerWith #-}
+
+
 
 -- | @floatingOrInteger@ determines if the scientific is floating point or
 -- integer.
@@ -877,22 +1047,53 @@ isInteger = isJust . isInteger_
 --
 -- @since 0.3.9
 --
+-- The check for a non-negative exponent is inlined, so for the common case
+-- callers make no call and, after case-of-case, allocate no 'Just'. The
+-- expensive negative exponent case is in 'isIntegerNegativeExponent'.
 isInteger_ :: Scientific -> Maybe Scientific
-isInteger_ s@(Scientific c e)
-    | e >= 0 = Just s
-    | c == 0 = Just (Scientific c 0)
-    | integerLog10' (abs c) < negate e = Nothing
+isInteger_ s@(Scientific _ e)
+    | e >= 0    = Just s
+    | otherwise = isIntegerNegativeExponent s
+{-# INLINE isInteger_ #-}
+
+-- | 'isInteger_' for a negative exponent.
+--
+-- A coefficient that fits in an 'Int' is divided on 'Int' with 'scaledInt'.
+-- The result always has exponent 0, which 'toIntegral' and the other
+-- callers rely on.
+isIntegerNegativeExponent :: Scientific -> Maybe Scientific
+isIntegerNegativeExponent (Scientific c e) = (\q -> Scientific q 0) <$> quotient
+  where
+    quotient = case classifyInteger c of
+      SmallInt ci -> case scaledInt ci e of
+        Just (SmallInt q) -> Just (toInteger q)
+        -- scaledInt never gives LargePositive or LargeNegative for a
+        -- negative exponent.
+        _                 -> Nothing
+      _ -> isIntegerNegativeExponentLarge c e
+
+-- | @c * 10^e@ for a coefficient outside the 'Int' range and a negative
+-- exponent, if it is an integer.
+isIntegerNegativeExponentLarge :: Integer -> Int -> Maybe Integer
+isIntegerNegativeExponentLarge c e
+    -- This is @integerLog10' (abs c) < negate e@, written as a sum so it
+    -- can't overflow: the log is non-negative and e is negative here.
+    -- @negate minBound == minBound@, so the negated form wrongly let
+    -- e == minBound through to @magnitude (negate e)@, which errors on a
+    -- negative argument.
+    | integerLog10' (abs c) + e < 0 = Nothing
 
     -- here the magnitude (negate e) is smaller than c because of previous check.
+    -- That also means e > minBound, so negate e doesn't overflow.
     -- thus dividing by it once is at least as fast as normalising of whole scientific number
     -- in the worst case.
     | c < 0
     , let (q, r) = quotRem (negate c) (magnitude (negate e))
-    = if r == 0 then Just (Scientific (negate q) 0) else Nothing
+    = if r == 0 then Just (negate q) else Nothing
 
     | otherwise
     , let (q, r) = quotRem c (magnitude (negate e))
-    = if r == 0 then Just (Scientific q 0) else Nothing
+    = if r == 0 then Just q else Nothing
 
 ----------------------------------------------------------------------
 -- Parsing

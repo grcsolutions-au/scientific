@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
@@ -9,6 +10,8 @@
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
 module Main where
+
+#include "MachDeps.h"
 
 import           Control.Monad
 import           Data.Int
@@ -61,6 +64,27 @@ main = testMain $ testGroup "scientific"
         , testCase "10...0e-1" $ True @=? isInteger (read $ '1' : replicate 1000000 '0' ++ "e-1" :: Scientific)
         , testCase "10...0e-10...0" $ True @=? isInteger (read $ '1' : replicate 1000000 '0' ++ "e-1000000" :: Scientific)
         , testCase "10...0e-20...0" $ False @=? isInteger (read $ '1' : replicate 1000000 '0' ++ "e-2000000" :: Scientific)
+        ]
+
+      -- negate minBound == minBound, which used to make isInteger_ call
+      -- magnitude with a negative argument (an error) in 0.3.10.0 and before.
+    , testGroup "exponent minBound"
+        [ testCase "isInteger 1e(minBound)"      $ False @=? isInteger (scientific 1 minBound)
+        , testCase "isInteger 123e(minBound)"    $ False @=? isInteger (scientific 123 minBound)
+        , testCase "isInteger -5e(minBound)"     $ False @=? isInteger (scientific (-5) minBound)
+        , testCase "isInteger 0e(minBound)"      $ True  @=? isInteger (scientific 0 minBound)
+        , testCase "isInteger 1e(minBound + 1)"  $ False @=? isInteger (scientific 1 (minBound + 1))
+        , testCase "isFloating 1e(minBound)"     $ True  @=? isFloating (scientific 1 minBound)
+        , testCase "toBoundedInteger 1e(minBound)" $
+            Nothing @=? toBoundedInteger @Int (scientific 1 minBound)
+        , testCase "toBoundedInteger 0e(minBound)" $
+            Just 0 @=? toBoundedInteger @Int (scientific 0 minBound)
+        , testCase "toBoundedIntegerOrErrorReason 1e(minBound)" $
+            Left NotAnInteger @=? toBoundedIntegerOrErrorReason @Int8 (scientific 1 minBound)
+        , testCase "toBoundedIntegerOrErrorReason -5e(minBound)" $
+            Left NotAnInteger @=? toBoundedIntegerOrErrorReason @Word8 (scientific (-5) minBound)
+        , testCase "floatingOrInteger 1e(minBound)" $
+            Left 0 @=? floatingOrInteger @Double @Integer (scientific 1 minBound)
         ]
 
     , testGroup "toBoundedInteger"
@@ -320,6 +344,215 @@ main = testMain $ testGroup "scientific"
           toBoundedInteger (scientific 0 1000) @?= Just (0 :: Int64)
       ]
     ]
+  , testGroup "toBoundedIntegerOrErrorReason"
+    [ testGroup "errors"
+      [ testCase "127 :: Int8"    $ toBoundedIntegerOrErrorReason @Int8 127 @?= Right 127
+      , testCase "128 :: Int8"    $ toBoundedIntegerOrErrorReason @Int8 128 @?= Left TooLarge
+      , testCase "1.28e2 :: Int8" $ toBoundedIntegerOrErrorReason @Int8 (read "1.28e2") @?= Left TooLarge
+      , testCase "-128 :: Int8"   $ toBoundedIntegerOrErrorReason @Int8 (-128) @?= Right (-128)
+      , testCase "-129 :: Int8"   $ toBoundedIntegerOrErrorReason @Int8 (-129) @?= Left TooSmall
+      , testCase "1.5 :: Int8"    $ toBoundedIntegerOrErrorReason @Int8 1.5 @?= Left NotAnInteger
+      , testCase "1200e-2 :: Int8"  $ toBoundedIntegerOrErrorReason @Int8 (scientific 1200 (-2)) @?= Right 12
+      , testCase "12800e-2 :: Int8" $ toBoundedIntegerOrErrorReason @Int8 (scientific 12800 (-2)) @?= Left TooLarge
+      , testCase "-12900e-2 :: Int8" $ toBoundedIntegerOrErrorReason @Int8 (scientific (-12900) (-2)) @?= Left TooSmall
+      , testCase "15e-1 :: Int8"    $ toBoundedIntegerOrErrorReason @Int8 (scientific 15 (-1)) @?= Left NotAnInteger
+        -- Negative exponents with an Int coefficient use the Int division
+        -- table, which ends at e = -18 on 64 bit platforms.
+      , testCase "12e-1 :: Int"     $ toBoundedIntegerOrErrorReason @Int (scientific 12 (-1)) @?= Left NotAnInteger
+      , testCase "1200e-2 :: Int"   $ toBoundedIntegerOrErrorReason @Int (scientific 1200 (-2)) @?= Right 12
+      , testCase "-1200e-2 :: Int"  $ toBoundedIntegerOrErrorReason @Int (scientific (-1200) (-2)) @?= Right (-12)
+      , testCase "0e-5 :: Int"      $ toBoundedIntegerOrErrorReason @Int (scientific 0 (-5)) @?= Right 0
+      , testCase "0e-5 :: NegativeInt" $ toBoundedIntegerOrErrorReason @NegativeInt (scientific 0 (-5)) @?= Left TooLarge
+        -- Zero past either end of the scaledInt table.
+      , testCase "0e1000 :: Int8"   $ toBoundedIntegerOrErrorReason @Int8 (scientific 0 1000) @?= Right 0
+      , testCase "0e1000 :: Word64" $ toBoundedIntegerOrErrorReason @Word64 (scientific 0 1000) @?= Right 0
+      , testCase "0e1000 :: Wide"   $ toBoundedIntegerOrErrorReason @Wide (scientific 0 1000) @?= Right 0
+      , testCase "0e19 :: Int"      $ toBoundedIntegerOrErrorReason @Int (scientific 0 19) @?= Right 0
+      , testCase "0e-19 :: Int"     $ toBoundedIntegerOrErrorReason @Int (scientific 0 (-19)) @?= Right 0
+      , testCase "0e-1000 :: Word8" $ toBoundedIntegerOrErrorReason @Word8 (scientific 0 (-1000)) @?= Right 0
+      , testCase "0e-1000 :: Wide"  $ toBoundedIntegerOrErrorReason @Wide (scientific 0 (-1000)) @?= Right 0
+      , testCase "0e(minBound) :: Int" $ toBoundedIntegerOrErrorReason @Int (scientific 0 minBound) @?= Right 0
+      , testCase "isInteger 0e-1000" $ isInteger (scientific 0 (-1000)) @?= True
+      , testCase "floatingOrInteger 0e-1000" $ floatingOrInteger @Double @Integer (scientific 0 (-1000)) @?= Right 0
+        -- A large coefficient with a negative exponent that normalises to a
+        -- value outside the Int range, for a type wider than Int.
+      , testCase "2^70 * 10 e-1 :: Wide" $ toBoundedIntegerOrErrorReason @Wide (scientific (2^(70::Int) * 10) (-1)) @?= Right (2^(70::Int))
+      , testCase "(2^70 + 1) * 10 e-1 :: Wide" $ toBoundedIntegerOrErrorReason @Wide (scientific ((2^(70::Int) + 1) * 10) (-1)) @?= Left TooLarge
+      , testCase "-(2^70) * 10 e-1 :: Wide" $ toBoundedIntegerOrErrorReason @Wide (scientific (-(2^(70::Int)) * 10) (-1)) @?= Right (-(2^(70::Int)))
+      , testCase "1e-18 :: Int"     $ toBoundedIntegerOrErrorReason @Int (scientific (10^(18::Int)) (-18)) @?= Right 1
+      , testCase "1e-19 :: Int"     $ toBoundedIntegerOrErrorReason @Int (scientific (10^(18::Int)) (-19)) @?= Left NotAnInteger
+      , testCase "5e-19 :: Int"     $ toBoundedIntegerOrErrorReason @Int (scientific 5 (-19)) @?= Left NotAnInteger
+      , testCase "maxBound Int e-1" $ toBoundedIntegerOrErrorReason @Int (scientific (toInteger (maxBound :: Int)) (-1)) @?= Left NotAnInteger
+      , testCase "minBound Int e-1" $ toBoundedIntegerOrErrorReason @Int (scientific (toInteger (minBound :: Int)) (-1)) @?= Left NotAnInteger
+      , testCase "-9e18 e-18 :: Int" $ toBoundedIntegerOrErrorReason @Int (scientific (-9 * 10^(18::Int)) (-18)) @?= Right (-9)
+      , testCase "128000e-3 :: Int8" $ toBoundedIntegerOrErrorReason @Int8 (scientific 128000 (-3)) @?= Left TooLarge
+      , testCase "-1000e-3 :: Word8" $ toBoundedIntegerOrErrorReason @Word8 (scientific (-1000) (-3)) @?= Left TooSmall
+        -- Large coefficients with negative exponents still use isInteger_.
+      , testCase "10^30 e-20 :: Int"  $ toBoundedIntegerOrErrorReason @Int (scientific (10^(30::Int)) (-20)) @?= Right (10^(10::Int))
+      , testCase "10^30 e-5 :: Int"   $ toBoundedIntegerOrErrorReason @Int (scientific (10^(30::Int)) (-5)) @?= Left TooLarge
+      , testCase "-10^30 e-5 :: Int"  $ toBoundedIntegerOrErrorReason @Int (scientific (-(10^(30::Int))) (-5)) @?= Left TooSmall
+      , testCase "(10^30 + 1) e-20 :: Int" $ toBoundedIntegerOrErrorReason @Int (scientific (10^(30::Int) + 1) (-20)) @?= Left NotAnInteger
+      , testCase "2^64 * 10 e-1 :: Word64" $ toBoundedIntegerOrErrorReason @Word64 (scientific (2^(64::Int) * 10 - 10) (-1)) @?= Right maxBound
+      , testCase "floatingOrInteger 0e-5" $ floatingOrInteger @Double @Integer (scientific 0 (-5)) @?= Right 0
+      , testCase "isInteger 1200e-2"  $ isInteger (scientific 1200 (-2)) @?= True
+      , testCase "isInteger 12e-1"    $ isInteger (scientific 12 (-1)) @?= False
+      , testCase "-1 :: Word8"    $ toBoundedIntegerOrErrorReason @Word8 (-1) @?= Left TooSmall
+      , testCase "-1.5 :: Word8"  $ toBoundedIntegerOrErrorReason @Word8 (-1.5) @?= Left NotAnInteger
+      , testCase "0 :: NegativeInt" $ toBoundedIntegerOrErrorReason @NegativeInt 0 @?= Left TooLarge
+      , testCase "0e1000 :: NegativeInt" $ toBoundedIntegerOrErrorReason @NegativeInt (scientific 0 1000) @?= Left TooLarge
+      , testCase "-5e1 :: NegativeInt" $ toBoundedIntegerOrErrorReason @NegativeInt (scientific (-5) 1) @?= Right (-50)
+      , testCase "1001 :: Narrow" $ toBoundedIntegerOrErrorReason @Narrow 1001 @?= Left TooLarge
+      , testCase "-1001 :: Narrow" $ toBoundedIntegerOrErrorReason @Narrow (-1001) @?= Left TooSmall
+      , testCase "1e3 :: Narrow" $ toBoundedIntegerOrErrorReason @Narrow (scientific 1 3) @?= Right 1000
+      , testCase "1e30 :: Narrow" $ toBoundedIntegerOrErrorReason @Narrow (scientific 1 30) @?= Left TooLarge
+      , testCase "2^64 :: Wide" $ toBoundedIntegerOrErrorReason @Wide (2^(64::Int)) @?= Right (2^(64::Int))
+      , testCase "-2^64 :: Wide" $ toBoundedIntegerOrErrorReason @Wide (-(2^(64::Int))) @?= Right (-(2^(64::Int)))
+      , testCase "1e20 :: Wide" $ toBoundedIntegerOrErrorReason @Wide (scientific 1 20) @?= Right (10^(20::Int))
+      , testCase "1e30 :: Wide" $ toBoundedIntegerOrErrorReason @Wide (scientific 1 30) @?= Left TooLarge
+      , testCase "-1e30 :: Wide" $ toBoundedIntegerOrErrorReason @Wide (scientific (-1) 30) @?= Left TooSmall
+        -- The exponent check that skips the slow path: boundsLog is 21 for
+        -- Wide (2^70 ~ 1.18e21) and 19 for Word64 (2^64 - 1 ~ 1.8e19).
+      , testCase "1e21 :: Wide"    $ toBoundedIntegerOrErrorReason @Wide (scientific 1 21) @?= Right (10^(21::Int))
+      , testCase "-1e21 :: Wide"   $ toBoundedIntegerOrErrorReason @Wide (scientific (-1) 21) @?= Right (-(10^(21::Int)))
+      , testCase "12e20 :: Wide"   $ toBoundedIntegerOrErrorReason @Wide (scientific 12 20) @?= Left TooLarge
+      , testCase "1e22 :: Wide"    $ toBoundedIntegerOrErrorReason @Wide (scientific 1 22) @?= Left TooLarge
+      , testCase "-1e22 :: Wide"   $ toBoundedIntegerOrErrorReason @Wide (scientific (-1) 22) @?= Left TooSmall
+      , testCase "1e19 :: Word64"  $ toBoundedIntegerOrErrorReason @Word64 (scientific 1 19) @?= Right (10^(19::Int))
+      , testCase "2e19 :: Word64"  $ toBoundedIntegerOrErrorReason @Word64 (scientific 2 19) @?= Left TooLarge
+      , testCase "1e20 :: Word64"  $ toBoundedIntegerOrErrorReason @Word64 (scientific 1 20) @?= Left TooLarge
+      , testCase "1e500 :: Word64" $ toBoundedIntegerOrErrorReason @Word64 (scientific 1 500) @?= Left TooLarge
+      , testCase "-1e500 :: Word64" $ toBoundedIntegerOrErrorReason @Word64 (scientific (-1) 500) @?= Left TooSmall
+      , testCase "5 :: AboveInt" $ toBoundedIntegerOrErrorReason @AboveInt 5 @?= Left TooSmall
+      , testCase "0 :: AboveInt" $ toBoundedIntegerOrErrorReason @AboveInt 0 @?= Left TooSmall
+      , testCase "2^70 :: AboveInt" $ toBoundedIntegerOrErrorReason @AboveInt (2^(70::Int)) @?= Right (2^(70::Int))
+      , testCase "1e30 :: AboveInt" $ toBoundedIntegerOrErrorReason @AboveInt (scientific 1 30) @?= Left TooLarge
+      , testCase "0 * 10^1000"    $ toBoundedIntegerOrErrorReason @Int8 (scientific 0 1000) @?= Right 0
+      , testCase "1e1000000000"   $ toBoundedIntegerOrErrorReason @Int (read "1e1000000000") @?= Left TooLarge
+      , testCase "-1e1000000000"  $ toBoundedIntegerOrErrorReason @Int (read "-1e1000000000") @?= Left TooSmall
+      , testCase "1e-1000000000"  $ toBoundedIntegerOrErrorReason @Int (read "1e-1000000000") @?= Left NotAnInteger
+      , testCase "2^31 :: Word32"     $ toBoundedIntegerOrErrorReason @Word32 (2^(31::Int)) @?= Right (2^(31::Int))
+      , testCase "2^32 - 1 :: Word32" $ toBoundedIntegerOrErrorReason @Word32 (2^(32::Int) - 1) @?= Right maxBound
+      , testCase "2^32 :: Word32"     $ toBoundedIntegerOrErrorReason @Word32 (2^(32::Int)) @?= Left TooLarge
+      , testCase "-2^63 - 1 :: Int"   $ toBoundedIntegerOrErrorReason @Int (-(2^(63::Int)) - 1) @?= Left TooSmall
+      , testCase "2^64 :: Word"       $ toBoundedIntegerOrErrorReason @Word (2^(64::Int)) @?= Left TooLarge
+      , testCase "maxBound Word64" $ toBoundedIntegerOrErrorReason @Word64 (fromIntegral (maxBound :: Word64)) @?= Right maxBound
+      , testCase "minBound Int64"  $ toBoundedIntegerOrErrorReason @Int64 (fromIntegral (minBound :: Int64)) @?= Right minBound
+      , testCase "2^63 - 1 :: Word64"     $ toBoundedIntegerOrErrorReason @Word64 (2^(63::Int) - 1) @?= Right (2^(63::Int) - 1)
+      , testCase "922337203685477581e1 :: Word64" $
+          toBoundedIntegerOrErrorReason @Word64 (scientific 922337203685477581 1) @?= Right 9223372036854775810
+      , testCase "1844674407370955162e1 :: Word64" $
+          toBoundedIntegerOrErrorReason @Word64 (scientific 1844674407370955162 1) @?= Left TooLarge
+      , testCase "2^63 :: Word64"         $ toBoundedIntegerOrErrorReason @Word64 (2^(63::Int)) @?= Right (2^(63::Int))
+      , testCase "2^64 - 1 :: Word64"     $ toBoundedIntegerOrErrorReason @Word64 (2^(64::Int) - 1) @?= Right maxBound
+      , testCase "2^64 :: Word64"         $ toBoundedIntegerOrErrorReason @Word64 (2^(64::Int)) @?= Left TooLarge
+      , testCase "2^63 * 10 :: Word64"    $ toBoundedIntegerOrErrorReason @Word64 (scientific (2^(63::Int)) 1) @?= Left TooLarge
+      , testCase "-2^63 :: Word64"        $ toBoundedIntegerOrErrorReason @Word64 (-(2^(63::Int))) @?= Left TooSmall
+      , testCase "-2^63 - 1 :: Word64"    $ toBoundedIntegerOrErrorReason @Word64 (-(2^(63::Int)) - 1) @?= Left TooSmall
+      , testCase "2^63 :: Int64"          $ toBoundedIntegerOrErrorReason @Int64 (2^(63::Int)) @?= Left TooLarge
+      , testCase "-2^63 - 1 :: Int64"     $ toBoundedIntegerOrErrorReason @Int64 (-(2^(63::Int)) - 1) @?= Left TooSmall
+      -- Coefficients from 2^31 to 2^63 take the big coefficient path on 32
+      -- bit platforms.
+      , testCase "3000000000 :: Int64"      $ toBoundedIntegerOrErrorReason @Int64 3000000000 @?= Right 3000000000
+      , testCase "-3000000000 :: Int64"     $ toBoundedIntegerOrErrorReason @Int64 (-3000000000) @?= Right (-3000000000)
+      , testCase "3000000000e9 :: Int64"    $ toBoundedIntegerOrErrorReason @Int64 (scientific 3000000000 9) @?= Right 3000000000000000000
+      , testCase "9300000000e9 :: Int64"    $ toBoundedIntegerOrErrorReason @Int64 (scientific 9300000000 9) @?= Left TooLarge
+      , testCase "-9300000000e9 :: Int64"   $ toBoundedIntegerOrErrorReason @Int64 (scientific (-9300000000) 9) @?= Left TooSmall
+      , testCase "3000000000e10 :: Int64"   $ toBoundedIntegerOrErrorReason @Int64 (scientific 3000000000 10) @?= Left TooLarge
+      , testCase "3000000000 :: Word64"     $ toBoundedIntegerOrErrorReason @Word64 3000000000 @?= Right 3000000000
+      , testCase "18446744073e9 :: Word64"  $ toBoundedIntegerOrErrorReason @Word64 (scientific 18446744073 9) @?= Right 18446744073000000000
+      , testCase "18446744074e9 :: Word64"  $ toBoundedIntegerOrErrorReason @Word64 (scientific 18446744074 9) @?= Left TooLarge
+      , testCase "-3000000000 :: Word64"    $ toBoundedIntegerOrErrorReason @Word64 (-3000000000) @?= Left TooSmall
+#if WORD_SIZE_IN_BITS == 64
+      , testCase "2^64 - 1 :: Word"       $ toBoundedIntegerOrErrorReason @Word (2^(64::Int) - 1) @?= Right maxBound
+#endif
+      ]
+    , testGroup "agrees with reference"
+      [ testGroup "Int"
+        [ testProperty "random" $ boundedIntegerProp (undefined :: Int)
+        , testCase "boundaries" $ boundedBoundaries (undefined :: Int)
+        , testProperty "toBoundedInteger matches reference" $ \s ->
+            toBoundedInteger s === (either (const Nothing) Just (boundedIntegerReference s) :: Maybe Int)
+        ]
+      , testGroup "Int8"
+        [ testProperty "random" $ boundedIntegerProp (undefined :: Int8)
+        , testCase "boundaries" $ boundedBoundaries (undefined :: Int8)
+        , testProperty "toBoundedInteger matches reference" $ \s ->
+            toBoundedInteger s === (either (const Nothing) Just (boundedIntegerReference s) :: Maybe Int8)
+        ]
+      , testGroup "Int16"
+        [ testProperty "random" $ boundedIntegerProp (undefined :: Int16)
+        , testCase "boundaries" $ boundedBoundaries (undefined :: Int16)
+        , testProperty "toBoundedInteger matches reference" $ \s ->
+            toBoundedInteger s === (either (const Nothing) Just (boundedIntegerReference s) :: Maybe Int16)
+        ]
+      , testGroup "Int32"
+        [ testProperty "random" $ boundedIntegerProp (undefined :: Int32)
+        , testCase "boundaries" $ boundedBoundaries (undefined :: Int32)
+        , testProperty "toBoundedInteger matches reference" $ \s ->
+            toBoundedInteger s === (either (const Nothing) Just (boundedIntegerReference s) :: Maybe Int32)
+        ]
+      , testGroup "Int64"
+        [ testProperty "random" $ boundedIntegerProp (undefined :: Int64)
+        , testCase "boundaries" $ boundedBoundaries (undefined :: Int64)
+        , testProperty "toBoundedInteger matches reference" $ \s ->
+            toBoundedInteger s === (either (const Nothing) Just (boundedIntegerReference s) :: Maybe Int64)
+        ]
+      , testGroup "Word"
+        [ testProperty "random" $ boundedIntegerProp (undefined :: Word)
+        , testCase "boundaries" $ boundedBoundaries (undefined :: Word)
+        , testProperty "toBoundedInteger matches reference" $ \s ->
+            toBoundedInteger s === (either (const Nothing) Just (boundedIntegerReference s) :: Maybe Word)
+        ]
+      , testGroup "Word8"
+        [ testProperty "random" $ boundedIntegerProp (undefined :: Word8)
+        , testCase "boundaries" $ boundedBoundaries (undefined :: Word8)
+        , testProperty "toBoundedInteger matches reference" $ \s ->
+            toBoundedInteger s === (either (const Nothing) Just (boundedIntegerReference s) :: Maybe Word8)
+        ]
+      , testGroup "Word16"
+        [ testProperty "random" $ boundedIntegerProp (undefined :: Word16)
+        , testCase "boundaries" $ boundedBoundaries (undefined :: Word16)
+        , testProperty "toBoundedInteger matches reference" $ \s ->
+            toBoundedInteger s === (either (const Nothing) Just (boundedIntegerReference s) :: Maybe Word16)
+        ]
+      , testGroup "Word32"
+        [ testProperty "random" $ boundedIntegerProp (undefined :: Word32)
+        , testCase "boundaries" $ boundedBoundaries (undefined :: Word32)
+        , testProperty "toBoundedInteger matches reference" $ \s ->
+            toBoundedInteger s === (either (const Nothing) Just (boundedIntegerReference s) :: Maybe Word32)
+        ]
+      , testGroup "Word64"
+        [ testProperty "random" $ boundedIntegerProp (undefined :: Word64)
+        , testCase "boundaries" $ boundedBoundaries (undefined :: Word64)
+        , testProperty "toBoundedInteger matches reference" $ \s ->
+            toBoundedInteger s === (either (const Nothing) Just (boundedIntegerReference s) :: Maybe Word64)
+        ]
+      , testGroup "NegativeInt"
+        [ testProperty "random" $ boundedIntegerProp (undefined :: NegativeInt)
+        , testCase "boundaries" $ boundedBoundaries (undefined :: NegativeInt)
+        , testProperty "toBoundedInteger matches reference" $ \s ->
+            toBoundedInteger s === (either (const Nothing) Just (boundedIntegerReference s) :: Maybe NegativeInt)
+        ]
+      , testGroup "Narrow"
+        [ testProperty "random" $ boundedIntegerProp (undefined :: Narrow)
+        , testCase "boundaries" $ boundedBoundaries (undefined :: Narrow)
+        , testProperty "toBoundedInteger matches reference" $ \s ->
+            toBoundedInteger s === (either (const Nothing) Just (boundedIntegerReference s) :: Maybe Narrow)
+        ]
+      , testGroup "Wide"
+        [ testProperty "random" $ boundedIntegerProp (undefined :: Wide)
+        , testCase "boundaries" $ boundedBoundaries (undefined :: Wide)
+        , testProperty "toBoundedInteger matches reference" $ \s ->
+            toBoundedInteger s === (either (const Nothing) Just (boundedIntegerReference s) :: Maybe Wide)
+        ]
+      , testGroup "AboveInt"
+        [ testProperty "random" $ boundedIntegerProp (undefined :: AboveInt)
+        , testCase "boundaries" $ boundedBoundaries (undefined :: AboveInt)
+        , testProperty "toBoundedInteger matches reference" $ \s ->
+            toBoundedInteger s === (either (const Nothing) Just (boundedIntegerReference s) :: Maybe AboveInt)
+        ]
+      ]
+    ]
   , testGroup "Predicates"
     [ testProperty "isFloating" $ \s -> isFloating s ==      genericIsFloating s
     , testProperty "isInteger"  $ \s -> isInteger  s == not (genericIsFloating s)
@@ -391,6 +624,44 @@ toBoundedIntegerConversion _ s =
                  s < fromIntegral (minBound :: i) ||
                  s > fromIntegral (maxBound :: i)
 
+-- | Reference implementation of 'toBoundedIntegerOrErrorReason'.
+boundedIntegerReference
+    :: forall i. (Integral i, Bounded i)
+    => Scientific -> Either ToBoundedIntegerError i
+boundedIntegerReference s
+    | isFloating s = Left NotAnInteger
+    | s < fromIntegral (minBound :: i) = Left TooSmall
+    | s > fromIntegral (maxBound :: i) = Left TooLarge
+    | otherwise = case floatingOrInteger s :: Either Double Integer of
+        Right n -> Right (fromInteger n)
+        Left _  -> Left NotAnInteger
+
+boundedIntegerProp
+    :: forall i. (Integral i, Bounded i, Show i)
+    => i -> Scientific -> Property
+boundedIntegerProp _ s =
+    toBoundedIntegerOrErrorReason s === (boundedIntegerReference s :: Either ToBoundedIntegerError i)
+
+-- | Checks every table entry: for each exponent, the coefficients around
+-- @bound `quot` 10^e@ must be classified as the reference does.
+boundedBoundaries
+    :: forall i. (Integral i, Bounded i, Show i)
+    => i -> Assertion
+boundedBoundaries _ = do
+    forM_ [0 .. 25] $ \e ->
+      forM_ [toInteger (minBound :: i), toInteger (maxBound :: i)] $ \bound ->
+        forM_ [-2 .. 2] $ \d ->
+          check (scientific (bound `quot` 10 ^ e + d) e)
+    -- Coefficients around the edges of the Int range, where the conversion
+    -- switches between the small and big coefficient paths.
+    forM_ [0 .. 2] $ \e ->
+      forM_ [toInteger (minBound :: Int), toInteger (maxBound :: Int)] $ \bound ->
+        forM_ [-2 .. 2] $ \d ->
+          check (scientific (bound + d) e)
+  where
+    check s =
+      toBoundedIntegerOrErrorReason s @?= (boundedIntegerReference s :: Either ToBoundedIntegerError i)
+
 bin :: (forall a. Num a => a -> a -> a) -> Scientific -> Scientific -> Bool
 bin op a b = toRational (a `op` b) == toRational a `op` toRational b
 
@@ -453,6 +724,32 @@ newtype NegativeInt = NegativeInt Int
 instance Bounded NegativeInt where
     minBound = -100
     maxBound = -10
+
+-- | Bounds that aren't powers of ten, to test the clamped bounds checks.
+newtype Narrow = Narrow Int
+    deriving (Show, Enum, Eq, Ord, Num, Real, Integral)
+
+instance Bounded Narrow where
+    minBound = -1000
+    maxBound = 1000
+
+-- | Bounds wider than 'Int' on both sides, so values outside the 'Int' range
+-- take the slow path.
+newtype Wide = Wide Integer
+    deriving (Show, Enum, Eq, Ord, Num, Real, Integral)
+
+instance Bounded Wide where
+    minBound = -(2 ^ (70 :: Int))
+    maxBound = 2 ^ (70 :: Int)
+
+-- | A range entirely above the 'Int' range, so every input takes the slow
+-- path.
+newtype AboveInt = AboveInt Integer
+    deriving (Show, Enum, Eq, Ord, Num, Real, Integral)
+
+instance Bounded AboveInt where
+    minBound = 2 ^ (70 :: Int)
+    maxBound = 2 ^ (71 :: Int)
 
 ----------------------------------------------------------------------
 -- QuickCheck instances
